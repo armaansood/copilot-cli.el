@@ -90,9 +90,14 @@
   :type '(repeat string)
   :group 'copilot-cli)
 
-(defcustom copilot-cli-terminal-backend 'eat
-  "Terminal backend used for Copilot CLI buffers."
-  :type '(choice (const :tag "eat" eat)
+(defcustom copilot-cli-terminal-backend
+  (if (eq system-type 'windows-nt) 'comint 'eat)
+  "Terminal backend used for Copilot CLI buffers.
+
+On Windows the default is `comint' since `eat' and `vterm' require
+Unix pseudo-terminals.  On other systems the default is `eat'."
+  :type '(choice (const :tag "comint (built-in, works everywhere)" comint)
+                 (const :tag "eat" eat)
                  (const :tag "vterm" vterm))
   :group 'copilot-cli)
 
@@ -311,6 +316,55 @@ KEY should be `return' or `escape'."
 
 (cl-defmethod copilot-cli--term-customize-faces ((_backend (eql vterm)))
   "Apply face customizations for vterm."
+  (face-remap-add-relative 'default 'copilot-cli-repl-face))
+
+;; --- comint backend ---
+
+(cl-defmethod copilot-cli--term-make ((_backend (eql comint)) buffer-name program switches)
+  "Create a comint process buffer.
+
+BUFFER-NAME, PROGRAM, and SWITCHES are as described in the generic.
+This backend works on all platforms including Windows."
+  (let* ((raw-name (if (and (string-prefix-p "*" buffer-name)
+                            (string-suffix-p "*" buffer-name))
+                       (substring buffer-name 1 -1)
+                     buffer-name))
+         (buf (apply #'make-comint-in-buffer raw-name buffer-name
+                     program nil (remq nil switches))))
+    (with-current-buffer buf
+      (setq-local comint-process-echoes nil)
+      (setq-local comint-prompt-read-only nil)
+      (ansi-color-for-comint-mode-on))
+    buf))
+
+(cl-defmethod copilot-cli--term-configure ((_backend (eql comint)))
+  "Configure comint terminal settings."
+  (when (fboundp 'ansi-color-for-comint-mode-on)
+    (ansi-color-for-comint-mode-on)))
+
+(cl-defmethod copilot-cli--term-send-string ((_backend (eql comint)) string)
+  "Send STRING to the comint process in the current buffer."
+  (let ((proc (get-buffer-process (current-buffer))))
+    (when proc
+      (comint-send-string proc string))))
+
+(cl-defmethod copilot-cli--term-send-key ((_backend (eql comint)) key)
+  "Send KEY to the comint process.
+
+KEY should be `return' or `escape'."
+  (let ((proc (get-buffer-process (current-buffer))))
+    (when proc
+      (pcase key
+        ('return (comint-send-string proc "\n"))
+        ('escape (comint-send-string proc "\e"))
+        (_ (comint-send-string proc (format "%s" key)))))))
+
+(cl-defmethod copilot-cli--term-setup-keymap ((_backend (eql comint)))
+  "Set up comint-specific key bindings."
+  nil)
+
+(cl-defmethod copilot-cli--term-customize-faces ((_backend (eql comint)))
+  "Apply face customizations for comint."
   (face-remap-add-relative 'default 'copilot-cli-repl-face))
 
 ;;;; Helper Functions
