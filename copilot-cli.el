@@ -319,52 +319,99 @@ KEY should be `return' or `escape'."
   (face-remap-add-relative 'default 'copilot-cli-repl-face))
 
 ;; --- comint backend ---
+;;
+;; Uses `make-process' with `:connection-type pty' (ConPTY on Windows)
+;; and `ansi-color' to render ANSI escape sequences.  This works on
+;; all platforms without external dependencies.
 
 (cl-defmethod copilot-cli--term-make ((_backend (eql comint)) buffer-name program switches)
-  "Create a comint process buffer.
+  "Create a process buffer with a PTY connection.
 
 BUFFER-NAME, PROGRAM, and SWITCHES are as described in the generic.
-This backend works on all platforms including Windows."
-  (let* ((raw-name (if (and (string-prefix-p "*" buffer-name)
-                            (string-suffix-p "*" buffer-name))
-                       (substring buffer-name 1 -1)
-                     buffer-name))
-         (buf (apply #'make-comint-in-buffer raw-name buffer-name
-                     program nil (remq nil switches))))
+Uses ConPTY on Windows, Unix PTY on other systems."
+  (let* ((buf (get-buffer-create buffer-name))
+         (cmd (cons program (remq nil switches)))
+         (proc (make-process
+                :name (string-trim buffer-name "*" "*")
+                :buffer buf
+                :command cmd
+                :connection-type 'pty
+                :noquery t
+                :filter #'copilot-cli--comint-filter
+                :sentinel #'copilot-cli--comint-sentinel)))
     (with-current-buffer buf
-      (setq-local comint-process-echoes nil)
-      (setq-local comint-prompt-read-only nil)
-      (ansi-color-for-comint-mode-on))
+      (setq-local copilot-cli--process proc))
     buf))
 
+(defvar-local copilot-cli--process nil
+  "The Copilot CLI process for this buffer.")
+
+(defun copilot-cli--comint-filter (proc output)
+  "Process filter that inserts OUTPUT with ANSI color rendering.
+
+PROC is the process that produced the output."
+  (when (buffer-live-p (process-buffer proc))
+    (with-current-buffer (process-buffer proc)
+      (let ((inhibit-read-only t)
+            (moving (= (point) (point-max))))
+        (save-excursion
+          (goto-char (point-max))
+          (insert (ansi-color-apply output)))
+        (when moving
+          (goto-char (point-max))
+          (dolist (win (get-buffer-window-list (current-buffer) nil t))
+            (set-window-point win (point-max))))))))
+
+(defun copilot-cli--comint-sentinel (proc event)
+  "Process sentinel that notifies when PROC ends.
+
+EVENT describes what happened."
+  (when (and copilot-cli-enable-notifications
+             (memq (process-status proc) '(exit signal)))
+    (funcall copilot-cli-notification-function
+             "Copilot CLI"
+             (format "Process %s" (string-trim event)))))
+
 (cl-defmethod copilot-cli--term-configure ((_backend (eql comint)))
-  "Configure comint terminal settings."
-  (when (fboundp 'ansi-color-for-comint-mode-on)
-    (ansi-color-for-comint-mode-on)))
-
-(cl-defmethod copilot-cli--term-send-string ((_backend (eql comint)) string)
-  "Send STRING to the comint process in the current buffer."
-  (let ((proc (get-buffer-process (current-buffer))))
-    (when proc
-      (comint-send-string proc string))))
-
-(cl-defmethod copilot-cli--term-send-key ((_backend (eql comint)) key)
-  "Send KEY to the comint process.
-
-KEY should be `return' or `escape'."
-  (let ((proc (get-buffer-process (current-buffer))))
-    (when proc
-      (pcase key
-        ('return (comint-send-string proc "\n"))
-        ('escape (comint-send-string proc "\e"))
-        (_ (comint-send-string proc (format "%s" key)))))))
-
-(cl-defmethod copilot-cli--term-setup-keymap ((_backend (eql comint)))
-  "Set up comint-specific key bindings."
+  "Configure comint/pty terminal settings."
   nil)
 
+(cl-defmethod copilot-cli--term-send-string ((_backend (eql comint)) string)
+  "Send STRING to the process in the current buffer."
+  (when-let ((proc (or copilot-cli--process
+                       (get-buffer-process (current-buffer)))))
+    (when (process-live-p proc)
+      (process-send-string proc string))))
+
+(cl-defmethod copilot-cli--term-send-key ((_backend (eql comint)) key)
+  "Send KEY to the process.
+
+KEY should be `return' or `escape'."
+  (when-let ((proc (or copilot-cli--process
+                       (get-buffer-process (current-buffer)))))
+    (when (process-live-p proc)
+      (pcase key
+        ('return (process-send-string proc "\r"))
+        ('escape (process-send-string proc "\e"))
+        (_ (process-send-string proc (format "%s" key)))))))
+
+(cl-defmethod copilot-cli--term-setup-keymap ((_backend (eql comint)))
+  "Set up key bindings for the comint/pty buffer."
+  ;; Make the buffer accept typed input and forward it to the process.
+  (local-set-key (kbd "RET")
+                 (lambda () (interactive)
+                   (copilot-cli--term-send-key 'comint 'return)))
+  (local-set-key (kbd "<escape>")
+                 (lambda () (interactive)
+                   (copilot-cli--term-send-key 'comint 'escape)))
+  ;; Forward self-inserting characters to the process.
+  (local-set-key [remap self-insert-command]
+                 (lambda () (interactive)
+                   (copilot-cli--term-send-string
+                    'comint (string last-command-event)))))
+
 (cl-defmethod copilot-cli--term-customize-faces ((_backend (eql comint)))
-  "Apply face customizations for comint."
+  "Apply face customizations for comint/pty."
   (face-remap-add-relative 'default 'copilot-cli-repl-face))
 
 ;;;; Helper Functions
