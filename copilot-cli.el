@@ -233,10 +233,14 @@ KEY is a symbol such as `return' or `escape'.")
 
 BUFFER-NAME, PROGRAM, and SWITCHES are as described in the generic."
   (require 'eat)
-  (let ((eat-buffer-name buffer-name)
-        (eat-term-name copilot-cli-term-name)
-        (eat-kill-buffer-on-exit t))
-    (eat-make buffer-name program nil switches)
+  (let ((eat-term-name copilot-cli-term-name)
+        (eat-kill-buffer-on-exit t)
+        ;; eat-make wraps NAME in *s, so strip ours to avoid double-wrapping.
+        (raw-name (if (and (string-prefix-p "*" buffer-name)
+                           (string-suffix-p "*" buffer-name))
+                      (substring buffer-name 1 -1)
+                    buffer-name)))
+    (apply #'eat-make raw-name program nil switches)
     (get-buffer buffer-name)))
 
 (cl-defmethod copilot-cli--term-configure ((_backend (eql eat)))
