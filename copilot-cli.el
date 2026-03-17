@@ -240,7 +240,7 @@ BUFFER-NAME, PROGRAM, and SWITCHES are as described in the generic."
                            (string-suffix-p "*" buffer-name))
                       (substring buffer-name 1 -1)
                     buffer-name)))
-    (apply #'eat-make raw-name program nil switches)
+    (apply #'eat-make raw-name program nil (remq nil switches))
     (get-buffer buffer-name)))
 
 (cl-defmethod copilot-cli--term-configure ((_backend (eql eat)))
@@ -325,8 +325,11 @@ KEY should be `return' or `escape'."
   "Generate a Copilot CLI buffer name for the current directory.
 
 When INSTANCE-NAME is non-nil and not empty, append it as a suffix."
-  (let ((dir-name (file-name-nondirectory
-                   (directory-file-name (copilot-cli--directory)))))
+  (let ((dir-name (let ((d (file-name-nondirectory
+                            (directory-file-name (copilot-cli--directory)))))
+                    (if (string-empty-p d)
+                        (copilot-cli--directory)
+                      d))))
     (if (and instance-name (not (string-empty-p instance-name)))
         (format "*copilot-cli: %s<%s>*" dir-name instance-name)
       (format "*copilot-cli: %s*" dir-name))))
