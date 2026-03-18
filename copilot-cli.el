@@ -320,47 +320,100 @@ KEY should be `return' or `escape'."
 
 ;; --- comint backend ---
 ;;
-;; On Windows, Copilot CLI (an Ink/React TUI) writes directly to the
-;; Windows Console API, which Emacs' ConPTY does not fully bridge.
-;; The workaround is to host copilot inside a PowerShell process,
-;; which provides the console that Ink needs.  On Unix systems,
-;; make-process with a PTY works directly.
+;; On Windows, Copilot CLI's Ink-based TUI cannot render inside Emacs
+;; because Emacs' ConPTY does not fully support the Windows Console
+;; API that Ink uses.  Instead, we use a prompt-based workflow: each
+;; user message launches `copilot -p` with `--no-alt-screen' and
+;; `--output-format text', streaming the response into the buffer.
+;;
+;; On Unix, make-process with a PTY works directly for the full TUI.
 
-(defun copilot-cli--comint-build-command (program switches)
+(defun copilot-cli--comint-build-command (program switches prompt)
   "Build the process command list for PROGRAM with SWITCHES.
 
-On Windows, wraps the command in a PowerShell invocation so that
-Ink-based TUI apps get a proper console host."
+When PROMPT is non-nil, run in non-interactive mode with that prompt.
+On Windows, always uses non-interactive mode with the appropriate flags."
   (let ((args (remq nil switches)))
     (if (eq system-type 'windows-nt)
-        (let ((inner (mapconcat #'identity (cons program args) " ")))
-          (list "powershell.exe" "-NoProfile" "-NoLogo" "-Command" inner))
-      (cons program args))))
+        (append (list program "--no-alt-screen" "--output-format" "text")
+                args
+                (when prompt (list "-p" prompt)))
+      (append (list program) args
+              (when prompt (list "-p" prompt))))))
 
 (cl-defmethod copilot-cli--term-make ((_backend (eql comint)) buffer-name program switches)
-  "Create a process buffer with a PTY connection.
+  "Create a Copilot CLI buffer.
 
 BUFFER-NAME, PROGRAM, and SWITCHES are as described in the generic.
-On Windows the process is hosted inside PowerShell so that Ink-based
-TUI apps render correctly."
-  (let* ((buf (get-buffer-create buffer-name))
-         (cmd (copilot-cli--comint-build-command program switches))
-         (process-environment (append (list "TERM=xterm-256color") process-environment))
-         (proc (make-process
-                :name (string-trim buffer-name "*" "*")
-                :buffer buf
-                :command cmd
-                :connection-type 'pty
-                :noquery t
-                :filter #'copilot-cli--comint-filter
-                :sentinel #'copilot-cli--comint-sentinel)))
-    (set-process-window-size proc 50 120)
+On Windows, starts an idle buffer ready to accept prompts via
+`copilot-cli-send-command'.  On Unix, starts the interactive TUI."
+  (let* ((buf (get-buffer-create buffer-name)))
     (with-current-buffer buf
-      (setq-local copilot-cli--process proc))
-    buf))
+      (setq-local copilot-cli--process nil)
+      (setq-local copilot-cli--program program)
+      (setq-local copilot-cli--switches switches)
+      (setq-local copilot-cli--busy nil)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (propertize "Copilot CLI ready. Use C-c g s to send a prompt.\n\n"
+                            'face 'font-lock-comment-face))))
+    (if (eq system-type 'windows-nt)
+        buf
+      ;; On Unix, start the interactive process directly.
+      (let* ((cmd (copilot-cli--comint-build-command program switches nil))
+             (process-environment (append (list "TERM=xterm-256color")
+                                          process-environment))
+             (proc (make-process
+                    :name (string-trim buffer-name "*" "*")
+                    :buffer buf
+                    :command cmd
+                    :connection-type 'pty
+                    :noquery t
+                    :filter #'copilot-cli--comint-filter
+                    :sentinel #'copilot-cli--comint-sentinel)))
+        (set-process-window-size proc 50 120)
+        (with-current-buffer buf
+          (setq-local copilot-cli--process proc))
+        buf))))
 
 (defvar-local copilot-cli--process nil
   "The Copilot CLI process for this buffer.")
+
+(defvar-local copilot-cli--program nil
+  "The Copilot CLI program for this buffer.")
+
+(defvar-local copilot-cli--switches nil
+  "Extra CLI switches for this buffer.")
+
+(defvar-local copilot-cli--busy nil
+  "Non-nil when a prompt is being processed.")
+
+(defun copilot-cli--comint-send-prompt (prompt)
+  "Send PROMPT to Copilot CLI and stream the response into the buffer.
+
+This launches a new `copilot -p' process for each prompt."
+  (let ((buf (copilot-cli--get-buffer)))
+    (unless buf
+      (user-error "No active Copilot CLI session for this directory"))
+    (with-current-buffer buf
+      (when copilot-cli--busy
+        (user-error "Copilot CLI is still processing a prompt"))
+      (setq copilot-cli--busy t)
+      (let* ((inhibit-read-only t)
+             (program (or copilot-cli--program copilot-cli-program))
+             (switches (or copilot-cli--switches copilot-cli-program-switches))
+             (cmd (copilot-cli--comint-build-command program switches prompt))
+             (proc (make-process
+                    :name (string-trim (buffer-name) "*" "*")
+                    :buffer buf
+                    :command cmd
+                    :connection-type 'pipe
+                    :noquery t
+                    :filter #'copilot-cli--comint-filter
+                    :sentinel #'copilot-cli--comint-prompt-sentinel)))
+        (goto-char (point-max))
+        (insert (propertize (format "\n> %s\n" prompt) 'face 'font-lock-keyword-face))
+        (setq-local copilot-cli--process proc)))))
 
 (defun copilot-cli--comint-filter (proc output)
   "Process filter that inserts OUTPUT with ANSI color rendering.
@@ -382,11 +435,27 @@ PROC is the process that produced the output."
   "Process sentinel that notifies when PROC ends.
 
 EVENT describes what happened."
+  (when (memq (process-status proc) '(exit signal))
+    (when copilot-cli-enable-notifications
+      (funcall copilot-cli-notification-function
+               "Copilot CLI"
+               (format "Process %s" (string-trim event))))))
+
+(defun copilot-cli--comint-prompt-sentinel (proc event)
+  "Sentinel for non-interactive prompt processes.
+
+PROC is the process, EVENT describes what happened.
+Marks the buffer as no longer busy and notifies the user."
+  (when (buffer-live-p (process-buffer proc))
+    (with-current-buffer (process-buffer proc)
+      (setq copilot-cli--busy nil)
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert (propertize "\n---\n" 'face 'font-lock-comment-face)))))
   (when (and copilot-cli-enable-notifications
              (memq (process-status proc) '(exit signal)))
     (funcall copilot-cli-notification-function
-             "Copilot CLI"
-             (format "Process %s" (string-trim event)))))
+             "Copilot CLI" "Response complete")))
 
 (cl-defmethod copilot-cli--term-configure ((_backend (eql comint)))
   "Configure comint/pty terminal settings."
@@ -394,37 +463,42 @@ EVENT describes what happened."
 
 (cl-defmethod copilot-cli--term-send-string ((_backend (eql comint)) string)
   "Send STRING to the process in the current buffer."
-  (when-let ((proc (or copilot-cli--process
-                       (get-buffer-process (current-buffer)))))
-    (when (process-live-p proc)
-      (process-send-string proc string))))
+  (if (eq system-type 'windows-nt)
+      ;; On Windows, send as a new prompt
+      (copilot-cli--comint-send-prompt string)
+    ;; On Unix, send directly to the running process
+    (when-let ((proc (or copilot-cli--process
+                         (get-buffer-process (current-buffer)))))
+      (when (process-live-p proc)
+        (process-send-string proc string)))))
 
 (cl-defmethod copilot-cli--term-send-key ((_backend (eql comint)) key)
   "Send KEY to the process.
 
 KEY should be `return' or `escape'."
-  (when-let ((proc (or copilot-cli--process
-                       (get-buffer-process (current-buffer)))))
-    (when (process-live-p proc)
-      (pcase key
-        ('return (process-send-string proc "\r"))
-        ('escape (process-send-string proc "\e"))
-        (_ (process-send-string proc (format "%s" key)))))))
+  (unless (eq system-type 'windows-nt)
+    (when-let ((proc (or copilot-cli--process
+                         (get-buffer-process (current-buffer)))))
+      (when (process-live-p proc)
+        (pcase key
+          ('return (process-send-string proc "\r"))
+          ('escape (process-send-string proc "\e"))
+          (_ (process-send-string proc (format "%s" key))))))))
 
 (cl-defmethod copilot-cli--term-setup-keymap ((_backend (eql comint)))
   "Set up key bindings for the comint/pty buffer."
-  ;; Make the buffer accept typed input and forward it to the process.
-  (local-set-key (kbd "RET")
-                 (lambda () (interactive)
-                   (copilot-cli--term-send-key 'comint 'return)))
-  (local-set-key (kbd "<escape>")
-                 (lambda () (interactive)
-                   (copilot-cli--term-send-key 'comint 'escape)))
-  ;; Forward self-inserting characters to the process.
-  (local-set-key [remap self-insert-command]
-                 (lambda () (interactive)
-                   (copilot-cli--term-send-string
-                    'comint (string last-command-event)))))
+  (unless (eq system-type 'windows-nt)
+    ;; On Unix with interactive TTY, forward input to the process.
+    (local-set-key (kbd "RET")
+                   (lambda () (interactive)
+                     (copilot-cli--term-send-key 'comint 'return)))
+    (local-set-key (kbd "<escape>")
+                   (lambda () (interactive)
+                     (copilot-cli--term-send-key 'comint 'escape)))
+    (local-set-key [remap self-insert-command]
+                   (lambda () (interactive)
+                     (copilot-cli--term-send-string
+                      'comint (string last-command-event))))))
 
 (cl-defmethod copilot-cli--term-customize-faces ((_backend (eql comint)))
   "Apply face customizations for comint/pty."
@@ -709,7 +783,8 @@ Prompts for the command in the minibuffer."
   (interactive
    (list (read-string "Send to Copilot CLI: " nil 'copilot-cli-command-history)))
   (copilot-cli--send-string command)
-  (copilot-cli--send-key 'return))
+  (unless (eq system-type 'windows-nt)
+    (copilot-cli--send-key 'return)))
 
 ;;;###autoload
 (defun copilot-cli-send-command-with-context (command)
@@ -725,7 +800,8 @@ Prepends the current file path and line number to the command."
                       command
                     (format "%s (context: %s:%d)" command file line))))
     (copilot-cli--send-string context)
-    (copilot-cli--send-key 'return)))
+    (unless (eq system-type 'windows-nt)
+      (copilot-cli--send-key 'return))))
 
 ;;;###autoload
 (defun copilot-cli-send-region (beg end)
