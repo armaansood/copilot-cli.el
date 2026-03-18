@@ -320,17 +320,32 @@ KEY should be `return' or `escape'."
 
 ;; --- comint backend ---
 ;;
-;; Uses `make-process' with `:connection-type pty' (ConPTY on Windows)
-;; and `ansi-color' to render ANSI escape sequences.  This works on
-;; all platforms without external dependencies.
+;; On Windows, Copilot CLI (an Ink/React TUI) writes directly to the
+;; Windows Console API, which Emacs' ConPTY does not fully bridge.
+;; The workaround is to host copilot inside a PowerShell process,
+;; which provides the console that Ink needs.  On Unix systems,
+;; make-process with a PTY works directly.
+
+(defun copilot-cli--comint-build-command (program switches)
+  "Build the process command list for PROGRAM with SWITCHES.
+
+On Windows, wraps the command in a PowerShell invocation so that
+Ink-based TUI apps get a proper console host."
+  (let ((args (remq nil switches)))
+    (if (eq system-type 'windows-nt)
+        (let ((inner (mapconcat #'identity (cons program args) " ")))
+          (list "powershell.exe" "-NoProfile" "-NoLogo" "-Command" inner))
+      (cons program args))))
 
 (cl-defmethod copilot-cli--term-make ((_backend (eql comint)) buffer-name program switches)
   "Create a process buffer with a PTY connection.
 
 BUFFER-NAME, PROGRAM, and SWITCHES are as described in the generic.
-Uses ConPTY on Windows, Unix PTY on other systems."
+On Windows the process is hosted inside PowerShell so that Ink-based
+TUI apps render correctly."
   (let* ((buf (get-buffer-create buffer-name))
-         (cmd (cons program (remq nil switches)))
+         (cmd (copilot-cli--comint-build-command program switches))
+         (process-environment (append (list "TERM=xterm-256color") process-environment))
          (proc (make-process
                 :name (string-trim buffer-name "*" "*")
                 :buffer buf
@@ -339,6 +354,7 @@ Uses ConPTY on Windows, Unix PTY on other systems."
                 :noquery t
                 :filter #'copilot-cli--comint-filter
                 :sentinel #'copilot-cli--comint-sentinel)))
+    (set-process-window-size proc 50 120)
     (with-current-buffer buf
       (setq-local copilot-cli--process proc))
     buf))
