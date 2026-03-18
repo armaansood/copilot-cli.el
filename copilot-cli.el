@@ -452,14 +452,21 @@ When INSTANCE-NAME is non-nil and not empty, append it as a suffix."
       (format "*copilot-cli: %s*" dir-name))))
 
 (defun copilot-cli--find-copilot-buffers-for-directory (dir)
-  "Find all live Copilot CLI buffers associated with DIR."
+  "Find all live Copilot CLI buffers with a running process for DIR."
   (let ((results nil)
+        (stale nil)
         (dir (expand-file-name dir)))
     (maphash (lambda (d buf-name)
-               (when (and (string= (expand-file-name d) dir)
-                          (get-buffer buf-name))
-                 (push buf-name results)))
+               (when (string= (expand-file-name d) dir)
+                 (let ((buf (get-buffer buf-name)))
+                   (if (and buf (get-buffer-process buf)
+                             (process-live-p (get-buffer-process buf)))
+                       (push buf-name results)
+                     (push d stale)))))
              copilot-cli--directory-buffer-map)
+    ;; Clean stale entries
+    (dolist (d stale)
+      (remhash d copilot-cli--directory-buffer-map))
     results))
 
 (defun copilot-cli--extract-instance-name-from-buffer-name (name)
